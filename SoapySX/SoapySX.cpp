@@ -3,6 +3,7 @@
 #include <SoapySDR/Device.hpp>
 #include <SoapySDR/Registry.hpp>
 #include <SoapySDR/Logger.hpp>
+#include <SoapySDR/Time.hpp>
 
 #include <string.h>
 #include <cassert>
@@ -258,7 +259,7 @@ class AlsaPcm {
 public:
     const char *name;
     snd_pcm_t *pcm;
-    std::mutex mutex;
+    mutable std::mutex mutex;
     snd_pcm_stream_t dir;
     enum stream_mode stream_mode;
     bool setup_done;
@@ -334,7 +335,7 @@ public:
         // as a stream argument to let applications make
         // a tradeoff between latency and CPU usage.
         hwp_period_size = 256;
-        hwp_buffer_size = 8192;
+        hwp_buffer_size = 65536;
 
         snd_pcm_uframes_t swp_boundary = 0;
 
@@ -420,19 +421,15 @@ private:
     uint8_t regs[MAX_REGS];
 
     // Convert a SoapySDR nanosecond timestamp to a sample counter.
-    int64_t timestamp_to_samples(long long timestamp)
+    int64_t timestamp_to_samples(long long timestamp) const
     {
-        // FIXME: floating point math start to lose precision
-        // when timestamp grows large. This works for initial testing though.
-        return round((double)timestamp * sampleRate / 1.0e9);
+        return SoapySDR::timeNsToTicks(timestamp, sampleRate);
     }
 
     // Convert a sample counter to a SoapySDR nanosecond timestamp.
-    long long samples_to_timestamp(int64_t samples)
+    long long samples_to_timestamp(int64_t samples) const
     {
-        // FIXME: floating point math start to lose precision
-        // when timestamp grows large. This works for initial testing though.
-        return round((double)samples * 1.0e9 / sampleRate);
+        return SoapySDR::ticksToTimeNs(samples, sampleRate);
     }
 
     // Set given bits of a register.
@@ -936,6 +933,40 @@ public:
         if (ret < 0) // Some other error
             return SOAPY_SDR_STREAM_ERROR;
         return buff_offset;
+    }
+
+    long long getHardwareTime(const std::string &what) const
+    {
+        if (what == "") {
+            // RX and TX streams should give similar results here.
+            //
+            // Use TX stream to avoid locking the RX stream mutex.
+            // Reasoning is that getHardwareTime seems most useful
+            // for determining timing of producing TX signals,
+            // and some applications might run RX and TX in different threads,
+            // we want to avoid locks between them, and I guess
+            // getHardwareTime is most likely to be called from a TX thread.
+            //
+            // The mutex is needed to avoid race conditions between updating
+            // our stream->position and the ALSA internal stream position,
+            // in case getHardwareTime gets called from some other thread
+            // while writeStream is running.
+
+            auto *stream = &alsa_tx;
+            std::scoped_lock lock(stream->mutex);
+            snd_pcm_t *pcm = stream->pcm;
+
+            snd_pcm_sframes_t pcm_avail = 0, pcm_delay = 0;
+            int ret = snd_pcm_avail_delay(pcm, &pcm_avail, &pcm_delay);
+            SoapySDR_logf(SOAPY_SDR_DEBUG, "hwt snd_pcm_avail_delay: %d %ld %ld  pos: %ld", ret, pcm_avail, pcm_delay, stream->position);
+            if (ret < 0) {
+                throw std::runtime_error("ALSA error");
+            } else {
+                return samples_to_timestamp(stream->position - (int64_t)pcm_delay);
+            }
+        } else {
+            throw std::runtime_error("Unsupported time");
+        }
     }
 
 /***********************************************************************
